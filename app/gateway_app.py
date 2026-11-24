@@ -1,4 +1,4 @@
-"""Gateway service: web UI + drill API, talking to the separate origin service."""
+"""Gateway service: web UI + comparison API, talking to two origin services."""
 
 from __future__ import annotations
 
@@ -8,8 +8,7 @@ from fastapi import FastAPI
 
 from .main import create_app
 
-ORIGIN_BASE = os.environ.get("DRILL_ORIGIN_BASE", "http://origin:8001")
+ORIGIN_A = os.environ.get("DRILL_ORIGIN_A", "http://origin-a:8001")
+ORIGIN_B = os.environ.get("DRILL_ORIGIN_B", "http://origin-b:8002")
 
-app: FastAPI = create_app(
-    origin_base=ORIGIN_BASE, serve_origin=False, origin_remote=True
-)
+app: FastAPI = create_app(ORIGIN_A, ORIGIN_B)

@@ -1,9 +1,20 @@
-# 跨机房镜像层分发演练
+# 跨机房镜像层核对
 
-一个 FastAPI 应用，用网页复现"多台构建机同时拉同一个镜像层"的跨机房分发：
-**只发起一次 HTTP 主下载**，快、慢两路同时消费同一份响应；慢端收到约 3/4 后暂停，
-网关为它留存正文；快端收齐后慢端续传，缺的尾巴再用条件 Range 回源补齐。
-最后两路都按**主下载当时那一版**的 SHA-256 校验。
+发版前，值班员在网页发起一次核对：两个机房各有一份**同长镜像层**（同一镜像的
+两个副本），需要找出两者在哪里没对上。本应用起两个本地 HTTP 源站，分别代表 A、
+B 两端，在网页上一次核对给出**全部差异字节区间**；核对只向源站取元数据，不下载
+层正文。
+
+演示覆盖三种情况：
+
+- **层一致**：两端逐块摘要相同，结论 `identical`；
+- **单块差异**：B 端换成"同长、只替换一个 64 KiB 块"的 `v2`，结论 `different`，
+  并列出精确到字节的差异区间；
+- **中途换版**：两端各自锁定首次应答的强 ETag 之后，B 端源站切回 `v1`；核对仍按
+  锁定时的两版进行，结论与"单块差异"一致，页面同时展示 B 端当前版本已变。
+
+另有**源站故障**场景：B 端在锁定后开始返回 503，核对标记为**未核完**（`incomplete`），
+不会把失败当成"一致"。
 
 ## 快速开始
 
@@ -13,119 +24,118 @@
 docker compose up --build
 ```
 
-- 网页与 API：<http://localhost:8000/>
-- 源站（独立服务）：<http://localhost:8001/origin/state>
+- 网页：<http://localhost:8000/>
+- 源站 A：<http://localhost:8001/origin/state>
+- 源站 B：<http://localhost:8002/origin/state>
 
-compose 把源站（`app.origin_app`）和网关（`app.gateway_app`）拆成两个容器，
-网关通过 `DRILL_ORIGIN_BASE=http://origin:8001` 回源，源站健康检查通过后网关才启动。
+compose 起三个服务：`origin-a`、`origin-b`（各自 `app.origin_app:app`）与
+`gateway`（`app.gateway_app:app`，网页 + 核对 API）。网关等两个源站健康检查通过后
+才启动，并分别通过 `DRILL_ORIGIN_A` / `DRILL_ORIGIN_B` 回源。
 
-### 本地单进程（源站与网页同一进程）
+### 本地三进程（与 compose 拓扑一致）
 
 ```bash
 python -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt
-uvicorn app.main:app --host 0.0.0.0 --port 8000
-```
-
-打开 <http://localhost:8000/> 即可。
-
-### 本地双进程（与 compose 拓扑一致）
-
-```bash
 DRILL_LAYER_BYTES=8388608 uvicorn app.origin_app:app --port 8001 &
-DRILL_ORIGIN_BASE=http://127.0.0.1:8001 uvicorn app.gateway_app:app --port 8000
+DRILL_LAYER_BYTES=8388608 uvicorn app.origin_app:app --port 8002 &
+DRILL_ORIGIN_A=http://127.0.0.1:8001 DRILL_ORIGIN_B=http://127.0.0.1:8002 \
+  uvicorn app.gateway_app:app --port 8000
 ```
 
-## 演练流程
+打开 <http://localhost:8000/>。
 
-1. 每次开始演练先把源站重置为 `v1`（长度 = `size_bytes`），并记录基线。
-2. 网关向源站发出**唯一一次**主下载 `GET /origin/layer`，响应带强 `ETag`
-   （形如 `"v1-<sha256>"`，无 `W/` 前缀）、`Content-Length` 和
-   `X-Content-SHA256`。
-3. 同一份字节流同时喂给快、慢两个接收端（各自独立计算 SHA-256）。
-4. 慢端到达 `pause_fraction`（默认 3/4）后暂停，之后网关把剩余正文尽量放进
-   留存缓冲区：先占内存到 `retention_memory_bytes`，再溢写到匿名临时文件，
-   两者合计不超过 `retention_bytes`；超出部分直接丢弃。
-5. 快端收齐后，慢端从留存缓冲区续传。仍缺的尾段向源站发
-   `Range: bytes=<start>-<end>` + `If-Range: <主下载的强 ETag>`。
-   只有同时满足以下条件才接收补段：
-   - 状态码 `206`（`If-Range` 失效时源站按 RFC 9110 返回 `200` 新版本）；
-   - 响应 `ETag` 是强校验器且与主下载完全一致；
-   - `Content-Range` 的起止与总长同请求及主下载一致；
-   - 响应 `X-Content-SHA256` 等于主下载那一版的摘要。
-   任一不符则**拒绝补段**，慢端只报缺段，绝不混版本。
-6. 总额度判断：慢端暂停时的尾段长度若不超过 `留存额度 + 回源额度`，源站未换版时
-   两路必须收齐；额度不足或版本已换成新版导致旧版补不齐时，只有慢端报缺段
-   （`outcome = slow_missing`，`missing_segments` 精确到字节区间）。
+## 核对怎么做
 
-网页实时显示：
+### 两端锁定
 
-- 两路**实收字节**与 SHA-256 校验结果（通过 / 未收齐 / 不匹配）；
-- 慢端暂停点、续传状态、缺段区间；
-- 补段的 ETag / 区间校验结果与额度余量；
-- **源站实发字节**（主下载 + 补段累计，来自源站计数器）；
-- **网关暂存峰值**（总峰值及内存 / 磁盘各自峰值）；
-- 源站是否在暂停时被换成等长新版，以及主下载仍继续发原版的事实。
+核对开始先重置两端为等长 `v1`，再对每端发**一次** `HEAD /origin/layer`。应答带
+强 ETag（形如 `"g1.20261124.base-<sha256 前 32 位>"`，无 `W/` 前缀）、长度、
+分块数与整层 SHA-256。两端分别把**这一版的 ETag 锁定**，之后所有元数据请求都带
+`If-Match: <锁定 ETag>`；源站即使已换版，也按锁定的那一版应答，并在响应头
+`X-Version-Locked: true` 中说明。因此"中途换版"不会让核对改比新版本，页面同时列出
+锁定 ETag 与源站当前版本。
 
-## 参数
+### 只取元数据
+
+源站的 `GET /origin/probe?windows=s:n,...` 返回请求窗口的摘要，正文是十六进制文本，
+**每个窗口 64 个字符**：
+
+```text
+block_digest(i)     = sha256(第 i 块的真实字节)          # 末块按实际长度
+window_digest(s, n) = sha256(block_digest(s) || ... || block_digest(s+n-1))
+```
+
+核对不会请求 `/origin/layer`（整个核对过程源站的 `layer_body_bytes` 为 0）。
+
+### 分块定位
+
+层按 64 KiB 分块。第 1 轮把整层切成 8 个粗窗口；对摘要不同的窗口继续按 8 路细分，
+直到单个块；单个块的差异换算成字节区间 `[block*64KiB, min(size,(block+1)*64KiB)-1]`，
+相邻块合并。末块长度不是 64 KiB 时按实际长度计算。
+
+- 层一致：1 轮探针、约 1 KiB 正文；
+- 单块差异：3–4 轮、约 2–4 KiB 正文；
+- 128 MiB、单块差异：每端 5 个核对请求（1 次 HEAD + 4 次探针），两端正文合计
+  3.5 KiB，远低于 16 KiB 上限。
+
+### 用量上限
+
+核对开始前会检查额度：**每端最多 16 个核对请求**（HEAD + 探针），**两端应答正文
+合计最多 16 KiB**。若继续细分会超限，则停止并标记为**未核完**，不猜结果。页面
+"实际用量"卡片显示两端请求数、两端正文合计、上限与剩余额度。
+
+## 参数与 API
 
 | 参数 | 含义 |
 | --- | --- |
-| `size_bytes` | 层大小（1 KiB–128 MiB） |
-| `chunk_size` / `chunk_delay_ms` | 主下载分块与节流，控制两路快慢节奏 |
-| `retention_bytes` | 网关为慢端留存的正文额度（**内存 + 磁盘合计**） |
-| `retention_memory_bytes` | 其中允许占用内存的上限，其余溢写磁盘 |
-| `backfill_bytes` | 允许额外回源的正文额度 |
-| `pause_fraction` | 慢端暂停点，默认 `0.75` |
-| `auto_switch_on_pause` | 慢端暂停时把源站换成等长 `v2`（主下载仍发 `v1`） |
-
-`retention_memory_bytes` 不得大于 `retention_bytes`，否则 422。
-
-## HTTP API
+| `size_bytes` | 层大小（64 KiB–128 MiB，默认 8 MiB） |
+| `scenario` | `match` / `single_block_diff` / `swap_midway` / `origin_fault` |
+| `diff_block` | 可选，指定 B 端 `v2` 替换第几块（负数从末尾数；留空用场景默认值） |
+| `max_requests_per_side` | 每端核对请求上限（默认 16，最大 16） |
+| `max_combined_body_bytes` | 两端正文合计上限（默认 16384，最大 16384） |
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| `GET` | `/api/drill` | 当前演练状态（含源站计数器、留存峰值） |
-| `POST` | `/api/drill` | 开始演练，body 同参数表 |
-| `POST` | `/api/drill/reset` | 取消当前演练并重置源站 |
-| `POST` | `/api/drill/switch?version=v2` | 手动换版（演练中会记录来源 `manual`） |
-| `GET` | `/api/origin` | 源站状态与两个版本 |
-| `GET` | `/origin/layer` | 源站正文（支持单段 Range / If-Range） |
-| `POST` | `/origin/switch` | 源站换版 |
-| `POST` | `/origin/reset` | 源站重置（可带 `size_bytes`） |
+| `GET` | `/` | 网页 |
+| `POST` | `/api/check` | 发起核对，body 同上 |
+| `GET` | `/api/check` | 当前核对状态（锁定的 ETag、差异区间、实际用量、事件） |
+| `POST` | `/api/check/cancel` | 取消 |
+| `GET` | `/api/health` | 网关与两个源站可达性 |
+| `GET` | `/api/origins` | 两个源站的版本与计数器 |
+| `HEAD` | `/origin/layer` | 源站元数据（强 ETag / 长度 / 分块数 / 整层摘要） |
+| `GET` | `/origin/probe?windows=s:n,...` | 窗口摘要，支持 `If-Match` 锁定版本 |
+| `GET` | `/origin/layer` | 源站正文（支持单段 Range / If-Range），核对不使用 |
+| `POST` | `/origin/{switch,reset,reset-stats,fault}` | 场景与测试用 |
 
 ## 验证
 
 ```bash
 pip install -r requirements-dev.txt
-python -m pytest -q          # 单元 + 端到端（真实 HTTP 主下载/补段）
-python scripts/selftest.py   # 双进程起 origin+gateway，跑 5 个场景并打印表格
+python -m pytest -q          # 12 项：源站单测 + 真实 HTTP 端到端核对
+python scripts/selftest.py   # 三进程起 A/B/网关，跑 5 个场景并打印用量表
 ```
 
-`scripts/selftest.py` 覆盖：
+`scripts/selftest.py` 覆盖：层一致、单块差异、中途换版、源站故障、128 MiB 单块差异；
+并断言每端请求 ≤ 16、两端正文合计 ≤ 16 KiB。
 
-1. 额度够补尾段 → 两路都收齐、两路 SHA-256 通过、源站只收到 1 次主下载；
-2. 留存 + 回源额度都不足 → 快端收齐，**只有慢端报缺段**；
-3. 暂停时换等长新版、尾段未全部留存 → 补段被拒（ETag 不符 / 源站回 200），
-   慢端报缺段，快端仍按原版校验通过；
-4. 暂停时换版但尾段全在留存缓冲区 → 不回源，两路都按原版收齐；
-5. 暂停中手动换版 → 记录 `manual`，仍然只有慢端受影响。
+## 已知限制与未完成事项
 
-## 已知限制
+- 两个源站的层字节由种子确定性生成，不落盘；`v1` 基线两端同种子所以逐字节相同。
+  若需要核对真实文件，需要另加"文件→分块"的读取路径（本次未做）。
+- 差异定位按 8 路细分，单次核对假定"差异块数量不多"（≤ 数十块）。如果差异极多，
+  额度会在核完前耗尽，结果标为未核完——这是有意的保守行为。
+- 核对请求串行按轮推进，未做多轮并发合并；128 MiB 约 0.1–0.3 s。
+- 源站是进程内状态（版本、计数器、故障注入），重启即清零；多网关共享同一对源站时
+  计数器会叠加，核对开始时会重置，因此同时只应跑一个核对。
+- 未在带真实网络的跨机房链路上验证；本次两个源站都在本地。
 
-- 演练中的"快端/慢端"是同进程内的两个消费者，用来模拟同机房快机与远机房慢机；
-  网络层的真实丢包/重传不在本次范围。
-- 源站的版本切换与计数器都是进程内状态，重启即清零；多网关实例共享同一源站时
-  计数器会累加，需要各自重置后观察。
-- 补段按"一片连续尾段"处理；当前设计慢端只会缺尾部连续区间，够用但未实现任意
-  多段 holes 的并行补齐。
+## 自测记录（2026-11-24）
 
-## 自测记录（2026-11-23）
-
-- `python -m pytest -q`：8 passed（留存缓冲区溢写/上限、等长双版本、端到端两路收齐、
-  额度不足、暂停换版、If-Range 失效回 200）。
-- `python scripts/selftest.py`：5 个场景全部通过，上表即其输出。
-- 网页渲染另用 jsdom 对 `slow_missing` 场景做了字段级检查（实收字节、校验结果、
-  缺段区间、补段 ETag/区间、源站实发、暂存峰值），全部命中。
-- 未执行项：本机无 Docker，`docker compose up --build` 未实际构建验证；compose 的
-  YAML、健康检查与双服务拆分已核对，并以同拓扑的双进程方式手工跑通。
+- `python -m pytest -q`：12 passed（源站强 ETag / If-Match 锁定 / 末块真实长度 /
+  区间换算 / 中途换版 / 源站故障 / 不可达源站 / 额度上限 / 128 MiB 用例）。
+- `python scripts/selftest.py`：5 个场景全部通过，输出见下表。
+- 128 MiB 单块差异：A 端 5 个请求、B 端 5 个请求，两端正文合计 3584 B，差异区间
+  `83886080-83951615`（65536 B）。
+- 本机无 Docker，`docker compose up --build` 未实际构建；compose 文件与 Dockerfile
+  已按同拓扑改写，并以三进程方式跑通上述 selftest。

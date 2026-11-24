@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
-"""Self-test: drive the public HTTP API through the key drill scenarios.
+"""Self-test: start two origins + the web gateway and drive real scenarios.
 
-This starts the origin and gateway services as two separate local processes
-(the same split as docker compose), then exercises the web API:
+Topology matches ``docker compose``: two origin processes and one gateway.
 
-1. pause at 3/4, combined quota covers the tail          -> both complete
-2. quota too small                                       -> slow reports missing
-3. origin swapped to an equal-length new version on pause -> slow reports missing
-4. origin swapped but full retention covered the tail     -> both complete
-5. manual switch while paused                            -> handled
+    origin-a : HTTP origin A
+    origin-b : HTTP origin B
+    gateway  : web UI + comparison API
+
+Scenarios:
+
+1. ``match``            layers identical -> identical, one probe round
+2. ``single_block_diff`` one 64 KiB block differs -> exact byte interval
+3. ``swap_midway``      B switches after locking -> still compares locked v2
+4. ``origin_fault``     B starts failing after locking -> incomplete
+5. ``single_block_diff`` on a 128 MiB layer -> budget limits still respected
 
 Exit code is non-zero when any expectation fails.
 """
@@ -27,6 +32,7 @@ import httpx
 
 ROOT = Path(__file__).resolve().parent.parent
 PYTHON = sys.executable
+BLOCK = 64 * 1024
 
 
 def free_port() -> int:
@@ -37,53 +43,56 @@ def free_port() -> int:
 
 class Services:
     def __init__(self) -> None:
-        self.origin_port = free_port()
-        self.gateway_port = free_port()
+        self.a_port = free_port()
+        self.b_port = free_port()
+        self.gw_port = free_port()
         self.procs: list[subprocess.Popen] = []
 
+    def _spawn(self, args: list[str], env: dict[str, str], log_path: Path) -> None:
+        handle = log_path.open("w")
+        self._logs.append(handle)
+        self.procs.append(
+            subprocess.Popen(
+                [PYTHON, "-m", "uvicorn", *args],
+                cwd=ROOT, env=env, stdout=handle, stderr=subprocess.STDOUT,
+            )
+        )
+
     def __enter__(self) -> "Services":
-        env = dict(os.environ)
-        env["PYTHONUNBUFFERED"] = "1"
-        env["DRILL_LAYER_BYTES"] = str(1024 * 1024)
-        log_dir = Path("/tmp/drill-selftest")
+        self._logs = []
+        log_dir = Path("/tmp/layer-check-selftest")
         log_dir.mkdir(exist_ok=True)
-        self._origin_log = (log_dir / "origin.log").open("w")
-        self._gateway_log = (log_dir / "gateway.log").open("w")
-        self.procs.append(
-            subprocess.Popen(
-                [
-                    PYTHON, "-m", "uvicorn", "app.origin_app:app",
-                    "--host", "127.0.0.1", "--port", str(self.origin_port),
-                    "--log-level", "warning",
-                ],
-                cwd=ROOT, env=env, stdout=self._origin_log, stderr=subprocess.STDOUT,
-            )
+        base_env = dict(os.environ)
+        base_env["PYTHONUNBUFFERED"] = "1"
+        base_env["DRILL_LAYER_BYTES"] = str(1024 * 1024)
+        self._spawn(
+            ["app.origin_app:app", "--host", "127.0.0.1",
+             "--port", str(self.a_port), "--log-level", "warning"],
+            base_env, log_dir / "origin-a.log",
         )
-        genv = dict(env)
-        genv["DRILL_ORIGIN_BASE"] = f"http://127.0.0.1:{self.origin_port}"
-        self.procs.append(
-            subprocess.Popen(
-                [
-                    PYTHON, "-m", "uvicorn", "app.gateway_app:app",
-                    "--host", "127.0.0.1", "--port", str(self.gateway_port),
-                    "--log-level", "warning",
-                ],
-                cwd=ROOT, env=genv, stdout=self._gateway_log, stderr=subprocess.STDOUT,
-            )
+        self._spawn(
+            ["app.origin_app:app", "--host", "127.0.0.1",
+             "--port", str(self.b_port), "--log-level", "warning"],
+            base_env, log_dir / "origin-b.log",
         )
-        self.origin = f"http://127.0.0.1:{self.origin_port}"
-        self.gateway = f"http://127.0.0.1:{self.gateway_port}"
-        deadline = time.time() + 20
+        gw_env = dict(base_env)
+        gw_env["DRILL_ORIGIN_A"] = f"http://127.0.0.1:{self.a_port}"
+        gw_env["DRILL_ORIGIN_B"] = f"http://127.0.0.1:{self.b_port}"
+        self._spawn(
+            ["app.gateway_app:app", "--host", "127.0.0.1",
+             "--port", str(self.gw_port), "--log-level", "warning"],
+            gw_env, log_dir / "gateway.log",
+        )
+        self.gateway = f"http://127.0.0.1:{self.gw_port}"
+        deadline = time.time() + 25
         while time.time() < deadline:
             try:
-                if httpx.get(self.origin + "/healthz", timeout=1).status_code == 200 and (
-                    httpx.get(self.gateway + "/api/health", timeout=1).status_code == 200
-                ):
+                if httpx.get(self.gateway + "/api/health", timeout=1).status_code == 200:
                     return self
             except httpx.HTTPError:
                 pass
             time.sleep(0.15)
-        raise RuntimeError("services did not become healthy; see /tmp/drill-selftest")
+        raise RuntimeError(f"services did not become healthy; see {log_dir}")
 
     def __exit__(self, *exc) -> None:
         for proc in self.procs:
@@ -93,177 +102,135 @@ class Services:
                 proc.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 proc.kill()
-        self._origin_log.close()
-        self._gateway_log.close()
+        for handle in self._logs:
+            handle.close()
 
 
-def run_drill(base: str, **overrides) -> dict:
-    manual_switch = bool(overrides.pop("_manual_switch", False))
-    payload = {
-        "size_bytes": 1024 * 1024,
-        "chunk_size": 64 * 1024,
-        "chunk_delay_ms": 4,
-        "retention_bytes": 128 * 1024,
-        "retention_memory_bytes": 64 * 1024,
-        "backfill_bytes": 512 * 1024,
-        "pause_fraction": 0.75,
-        "auto_switch_on_pause": False,
-        "switch_version": "v2",
-    }
-    payload.update(overrides)
-    with httpx.Client(base_url=base, timeout=60) as client:
-        resp = client.post("/api/drill", json=payload)
+def run_check(base: str, timeout: float = 120, **payload) -> dict:
+    body = {"size_bytes": 1024 * 1024, "scenario": "match"}
+    body.update(payload)
+    with httpx.Client(base_url=base, timeout=30) as client:
+        resp = client.post("/api/check", json=body)
         resp.raise_for_status()
-        deadline = time.time() + 90
+        deadline = time.time() + timeout
         while time.time() < deadline:
-            state = client.get("/api/drill").json()
+            state = client.get("/api/check").json()
             if state["status"] != "running":
                 return state
-            if manual_switch and state["phase"] == "slow_paused":
-                client.post("/api/drill/switch", params={"version": "v2"})
-                manual_switch = False
-            time.sleep(0.01)
-    raise RuntimeError("drill timed out")
+            time.sleep(0.02)
+    raise RuntimeError("check timed out")
 
 
 def summarize(name: str, state: dict) -> dict:
+    a, b = state["sides"]["a"], state["sides"]["b"]
     return {
         "scenario": name,
         "outcome": state["outcome"],
-        "fast": state["fast"]["received_bytes"],
-        "fast_sha": state["fast"]["verification"]["result"],
-        "slow": state["slow"]["received_bytes"],
-        "slow_sha": state["slow"]["verification"]["result"],
-        "missing": state["slow"]["missing_bytes"],
-        "backfill": state["slow"]["backfill"]["status"],
-        "etag_ok": state["slow"]["backfill"]["etag_verified"],
-        "range_ok": state["slow"]["backfill"]["range_verified"],
-        "retention_peak": state["retention"]["peak_bytes"],
-        "retention_mem_peak": state["retention"]["peak_memory_bytes"],
-        "retention_disk_peak": state["retention"]["peak_disk_bytes"],
-        "origin_sent": state["origin"]["bytes_sent"],
-        "origin_version": state["origin"]["current_version"],
-        "switched": state["origin_switch"]["triggered"],
-        "main_requests": state["origin"]["main_requests"],
-        "range_requests": state["origin"]["range_requests"],
+        "diffs": state["difference_count"],
+        "diff_bytes": state["difference_bytes"],
+        "a_req": a["requests"],
+        "b_req": b["requests"],
+        "body_bytes": state["budget"]["combined_body_bytes"],
+        "a_etag": a["locked_etag"],
+        "b_etag": b["locked_etag"],
+        "a_ver": a["locked_version"],
+        "b_ver": b["locked_version"],
+        "b_now": b["current_version"],
+        "b_locked_served": b["locked_served"],
+        "error": state["error"],
     }
 
 
 def main() -> int:
     failures: list[str] = []
     results: list[dict] = []
+    size = 1024 * 1024
+    diff_block = 3
 
     with Services() as svc:
-        total = 1024 * 1024
+        state = run_check(svc.gateway, scenario="match", size_bytes=size)
+        results.append(summarize("match", state))
+        if not (
+            state["outcome"] == "identical"
+            and state["difference_count"] == 0
+            and state["sides"]["a"]["locked_etag"]
+            and state["sides"]["a"]["locked_etag"] == state["sides"]["b"]["locked_etag"]
+            and state["sides"]["a"]["requests"] <= 16
+            and state["sides"]["b"]["requests"] <= 16
+        ):
+            failures.append("match")
 
-        # 1. Combined quota covers a 256 KiB tail: 128 KiB retained + 512 KiB
-        #    backfill is more than enough.
-        state = run_drill(svc.gateway)
-        results.append(summarize("quota covers tail", state))
-        ok = (
-            state["outcome"] == "both_complete"
-            and state["fast"]["received_bytes"] == total
-            and state["slow"]["received_bytes"] == total
-            and state["fast"]["verification"]["result"] == "match"
-            and state["slow"]["verification"]["result"] == "match"
-            and state["slow"]["backfill"]["etag_verified"]
-            and state["slow"]["backfill"]["range_verified"]
-            and state["origin"]["main_requests"] == 1
+        state = run_check(
+            svc.gateway, scenario="single_block_diff",
+            size_bytes=size, diff_block=diff_block,
         )
-        if not ok:
-            failures.append("scenario 1 (quota covers tail)")
+        results.append(summarize("single_block_diff", state))
+        diff = (state["differences"] or [{}])[0]
+        if not (
+            state["outcome"] == "different"
+            and state["difference_count"] == 1
+            and diff.get("start") == diff_block * BLOCK
+            and diff.get("end") == diff_block * BLOCK + BLOCK - 1
+            and diff.get("length") == BLOCK
+            and state["sides"]["a"]["requests"] <= 16
+            and state["sides"]["b"]["requests"] <= 16
+            and state["budget"]["combined_body_bytes"] <= 16 * 1024
+        ):
+            failures.append("single_block_diff")
 
-        # 2. Retention 8 KiB + backfill 8 KiB cannot cover a 256 KiB tail.
-        state = run_drill(
-            svc.gateway,
-            retention_bytes=8 * 1024,
-            retention_memory_bytes=4 * 1024,
-            backfill_bytes=8 * 1024,
+        state = run_check(
+            svc.gateway, scenario="swap_midway",
+            size_bytes=size, diff_block=diff_block,
         )
-        results.append(summarize("quota too small", state))
-        ok = (
-            state["outcome"] == "slow_missing"
-            and state["fast"]["received_bytes"] == total
-            and state["fast"]["verification"]["result"] == "match"
-            and state["slow"]["verification"]["result"] == "incomplete"
-            and state["slow"]["missing_bytes"] > 0
-            and state["origin"]["main_requests"] == 1
-        )
-        if not ok:
-            failures.append("scenario 2 (quota too small)")
+        results.append(summarize("swap_midway", state))
+        if not (
+            state["outcome"] == "different"
+            and state["sides"]["a"]["locked_version"] == "v1"
+            and state["sides"]["b"]["locked_version"] == "v2"
+            and state["sides"]["b"]["current_version"] == "v1"
+            and state["sides"]["b"]["locked_served"] is True
+            and [d["block"] for d in state["differences"]] == [diff_block]
+        ):
+            failures.append("swap_midway")
 
-        # 3. Auto-swap on pause; the tail is not fully retained, so the If-Range
-        #    backfill sees v2 -> must be rejected and reported as missing.
-        state = run_drill(
-            svc.gateway,
-            retention_bytes=8 * 1024,
-            retention_memory_bytes=4 * 1024,
-            backfill_bytes=1024 * 1024,
-            auto_switch_on_pause=True,
-        )
-        results.append(summarize("auto swap, tail not retained", state))
-        ok = (
-            state["origin_switch"]["triggered"]
-            and state["origin"]["current_version"] == "v2"
-            and state["slow"]["backfill"]["status"] == "rejected"
-            and state["slow"]["backfill"]["etag_verified"] is False
-            and state["outcome"] == "slow_missing"
-            and state["fast"]["received_bytes"] == total
-            and state["fast"]["verification"]["result"] == "match"
-            and state["origin"]["main_requests"] == 1
-        )
-        if not ok:
-            failures.append("scenario 3 (auto swap, tail not retained)")
+        state = run_check(svc.gateway, scenario="origin_fault", size_bytes=size)
+        results.append(summarize("origin_fault", state))
+        if not (
+            state["outcome"] == "incomplete"
+            and state["error"]
+            and state["sides"]["b"]["locked_etag"]
+            and "503" in (state["sides"]["b"]["error"] or "")
+        ):
+            failures.append("origin_fault")
 
-        # 4. Retain the whole tail in memory, swap on pause, no backfill needed.
-        state = run_drill(
-            svc.gateway,
-            retention_bytes=total,
-            retention_memory_bytes=total,
-            backfill_bytes=0,
-            auto_switch_on_pause=True,
+        big = 128 * 1024 * 1024
+        state = run_check(
+            svc.gateway, timeout=180, scenario="single_block_diff", size_bytes=big
         )
-        results.append(summarize("auto swap, full retention", state))
-        ok = (
-            state["origin_switch"]["triggered"]
-            and state["slow"]["backfill"]["attempted"] is False
-            and state["outcome"] == "both_complete"
-            and state["slow"]["verification"]["result"] == "match"
-            and state["fast"]["verification"]["result"] == "match"
-            and state["retention"]["peak_bytes"] == total - 3 * total // 4
-        )
-        if not ok:
-            failures.append("scenario 4 (auto swap, full retention)")
-
-        # 5. Manual swap while the slow route is paused.
-        state = run_drill(
-            svc.gateway,
-            retention_bytes=8 * 1024,
-            retention_memory_bytes=4 * 1024,
-            backfill_bytes=1024 * 1024,
-            chunk_delay_ms=40,
-            _manual_switch=True,
-        )
-        results.append(summarize("manual swap during pause", state))
-        ok = (
-            state["origin_switch"]["triggered"]
-            and state["origin_switch"]["source"] == "manual"
-            and state["slow"]["paused"]
-            and state["origin"]["current_version"] == "v2"
-            and state["fast"]["received_bytes"] == total
-        )
-        if not ok:
-            failures.append("scenario 5 (manual swap during pause)")
+        results.append(summarize("128MiB single_block_diff", state))
+        if not (
+            state["outcome"] == "different"
+            and state["difference_count"] == 1
+            and state["differences"][0]["length"] == BLOCK
+            and state["sides"]["a"]["requests"] <= 16
+            and state["sides"]["b"]["requests"] <= 16
+            and state["budget"]["combined_body_bytes"] <= 16 * 1024
+        ):
+            failures.append("128MiB single_block_diff")
 
     print(json.dumps(results, indent=2, ensure_ascii=False))
     print()
-    print(f"{'scenario':32} {'outcome':14} {'fast':>9} {'slow':>9} {'missing':>9} "
-          f"{'backfill':>11} {'ret peak':>10} {'origin sent':>12}")
+    header = (
+        f"{'scenario':26} {'outcome':11} {'diffs':>5} {'diffB':>8} "
+        f"{'a_req':>5} {'b_req':>5} {'bodyB':>7} {'b_locked':>9} {'b_now':>6}"
+    )
+    print(header)
     for r in results:
         print(
-            f"{r['scenario']:32} {r['outcome']:14} {r['fast']:>9} {r['slow']:>9} "
-            f"{r['missing']:>9} {r['backfill']:>11} {r['retention_peak']:>10} "
-            f"{r['origin_sent']:>12}"
+            f"{r['scenario']:26} {r['outcome']:11} {r['diffs']:>5} "
+            f"{r['diff_bytes']:>8} {r['a_req']:>5} {r['b_req']:>5} "
+            f"{r['body_bytes']:>7} {str(r['b_locked_served']):>9} "
+            f"{str(r['b_now']):>6}"
         )
     print()
     if failures:

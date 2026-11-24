@@ -1,6 +1,6 @@
 (() => {
   const $ = (id) => document.getElementById(id);
-  const form = $("drill-form");
+  const form = $("check-form");
   const notice = $("notice");
   let pollTimer = null;
 
@@ -10,9 +10,11 @@
     return n.toLocaleString("en-US");
   };
 
-  const pct = (part, total) => {
-    if (!total) return 0;
-    return Math.max(0, Math.min(100, (part / total) * 100));
+  const bytes = (n) => {
+    if (typeof n !== "number") return "-";
+    if (n >= 1024 * 1024 && n % (1024 * 1024) === 0) return `${fmt(n)} (${n / (1024 * 1024)} MiB)`;
+    if (n >= 1024 && n % 1024 === 0) return `${fmt(n)} (${n / 1024} KiB)`;
+    return fmt(n);
   };
 
   function showNotice(text, kind = "error") {
@@ -20,7 +22,6 @@
     notice.className = `notice ${kind}`;
     notice.textContent = text;
   }
-
   function clearNotice() {
     notice.hidden = true;
     notice.textContent = "";
@@ -28,40 +29,26 @@
 
   function formPayload() {
     const data = new FormData(form);
-    const num = (name) => Number(data.get(name));
-    return {
-      size_bytes: num("size_bytes"),
-      chunk_size: num("chunk_size"),
-      chunk_delay_ms: num("chunk_delay_ms"),
-      retention_bytes: num("retention_bytes"),
-      retention_memory_bytes: num("retention_memory_bytes"),
-      backfill_bytes: num("backfill_bytes"),
-      pause_fraction: Number(data.get("pause_fraction")),
-      auto_switch_on_pause: data.get("auto_switch_on_pause") === "on",
-      switch_version: "v2",
+    const payload = {
+      size_bytes: Number(data.get("size_bytes")),
+      scenario: data.get("scenario"),
+      max_requests_per_side: 16,
+      max_combined_body_bytes: 16384,
     };
+    const raw = String(data.get("diff_block") || "").trim();
+    if (raw !== "") payload.diff_block = Number(raw);
+    return payload;
   }
 
-  function verifyClass(result) {
-    if (result === "match") return "match";
-    if (result === "mismatch" || result === "incomplete") return "incomplete";
-    return "pending";
-  }
-
-  function renderVerify(el, v) {
-    if (!v || !v.actual || v.result === "pending") {
-      el.textContent = "待运行"; el.className = "pending"; el.title = ""; return;
-    }
-    const label = v.result === "match" ? "通过" : v.result === "incomplete" ? "未收齐" : "不匹配";
-    el.textContent = `${label} · ${v.actual ? v.actual.slice(0, 16) + "…" : "-"}`;
-    el.title = `expected ${v.expected || "-"}\nactual   ${v.actual || "-"}`;
-    el.className = verifyClass(v.result);
+  function setBusy(running) {
+    $("start-btn").disabled = running;
+    $("cancel-btn").disabled = !running;
   }
 
   function renderEvents(events) {
     const list = $("events");
     list.innerHTML = "";
-    (events || []).slice(-80).forEach((e) => {
+    (events || []).slice(-100).forEach((e) => {
       const li = document.createElement("li");
       const t = document.createElement("span");
       t.className = "t";
@@ -77,88 +64,120 @@
     list.scrollTop = list.scrollHeight;
   }
 
+  function renderSide(prefix, side) {
+    const s = side || {};
+    $(`${prefix}-etag`).textContent = s.locked_etag || "-";
+    $(`${prefix}-version`).textContent = s.locked_version || (s.lock_status === "failed" ? "锁定失败" : "-");
+    $(`${prefix}-current`).textContent = s.current_version || "-";
+    $(`${prefix}-size`).textContent = s.size
+      ? `${fmt(s.size)} / ${fmt(s.blocks)} 块`
+      : "-";
+    const served = s.locked_served;
+    $(`${prefix}-served`).textContent =
+      served === true ? "是（已换版，按锁定版应答）" :
+      served === false ? "是（当前版即锁定版）" :
+      "-";
+    $(`${prefix}-served`).className = "v " + (served === true ? "incomplete" : "match");
+    $(`${prefix}-req`).textContent = fmt(s.requests || 0);
+    $(`${prefix}-body`).textContent = fmt(s.body_bytes || 0);
+  }
+
+  function renderDifferences(diffs, outcome) {
+    const body = $("diff-body");
+    body.innerHTML = "";
+    const list = diffs || [];
+    $("no-diff").hidden = list.length > 0;
+    $("no-diff").textContent =
+      outcome === "incomplete" ? "未核完，已确认的差异为零。"
+      : outcome === "pending" ? "核对进行中…"
+      : "未发现差异。";
+    $("diff-table").hidden = list.length === 0;
+    list.forEach((d, i) => {
+      const tr = document.createElement("tr");
+      const cells = [
+        String(i + 1),
+        `${fmt(d.start)}`,
+        `${fmt(d.end)}`,
+        `${fmt(d.length)}`,
+        d.blocks ? `${d.blocks} 块` : "-",
+      ];
+      cells.forEach((text, idx) => {
+        const td = document.createElement("td");
+        td.textContent = text;
+        if (idx === 1 || idx === 2 || idx === 3) td.className = "mono";
+        tr.append(td);
+      });
+      body.append(tr);
+    });
+  }
+
   function render(state) {
-    const total = state.total_bytes || 0;
-    $("phase").textContent = state.phase || "idle";
-    $("outcome").textContent =
-      state.outcome === "both_complete" ? "两路均收齐（both_complete）" :
-      state.outcome === "slow_missing" ? "仅慢端缺段（slow_missing）" :
-      state.outcome === "pending" ? "运行中/待运行" : (state.outcome || "-");
-    $("total-bytes").textContent = total ? fmt(total) : "-";
-    const main = state.main || {};
-    $("main-etag").textContent = main.etag || "-";
-    $("expected-sha").textContent = main.expected_sha256 || "-";
-    $("elapsed").textContent = state.elapsed_ms ? `${fmt(state.elapsed_ms)} ms` : "-";
-
-    const fast = state.fast || { received_bytes: 0 };
-    const slow = state.slow || { received_bytes: 0 };
-    $("fast-bytes").textContent = fmt(fast.received_bytes || 0);
-    $("slow-bytes").textContent = fmt(slow.received_bytes || 0);
-    $("fast-bar").style.width = `${pct(fast.received_bytes || 0, total)}%`;
-    $("slow-bar").style.width = `${pct(slow.received_bytes || 0, total)}%`;
-    renderVerify($("fast-verify"), fast.verification);
-    renderVerify($("slow-verify"), slow.verification);
-
-    const missing = slow.missing_segments || [];
-    $("slow-missing").textContent = missing.length
-      ? missing.map((s) => `${s.start}-${s.end} (${fmt(s.length)}B)`).join(", ")
-      : "无";
-    $("slow-pause").textContent = slow.pause_threshold_bytes
-      ? `${fmt(slow.paused_at_bytes || 0)} / 阈值 ${fmt(slow.pause_threshold_bytes)}`
+    const status = state.status || "idle";
+    $("status").textContent =
+      status === "idle" ? "待运行" :
+      status === "running" ? "核对中…" :
+      status === "done" ? "已完成" : status;
+    const outcome = state.outcome || "pending";
+    $("outcome").textContent = state.outcome_label || outcome;
+    $("outcome").className =
+      "v " + (outcome === "identical" ? "match" :
+              outcome === "different" || outcome === "incomplete" ? "incomplete"
+              : "pending");
+    const params = state.params || {};
+    $("scenario").textContent = params.scenario_label || params.scenario || "-";
+    $("size-info").textContent = params.size_bytes
+      ? `${bytes(params.size_bytes)} / ${fmt(state.block_size)} B`
       : "-";
-    $("slow-resumed").textContent = slow.resumed ? "已续传" : (slow.paused ? "已暂停" : "-");
-
-    const bf = slow.backfill || {};
-    $("backfill-verify").textContent = bf.attempted
-      ? `ETag ${bf.etag_verified ? "✓" : "✗"} · 区间 ${bf.range_verified ? "✓" : "✗"}`
+    $("diff-summary").textContent = state.params
+      ? `${fmt(state.difference_count || 0)} 段 / ${bytes(state.difference_bytes || 0)}`
+        + (state.outcome === "incomplete" ? "（未核完，仅为已确认部分）" : "")
       : "-";
-    $("backfill-status").textContent = bf.status || "-";
-    $("backfill-quota").textContent = bf.quota_bytes !== undefined
-      ? `${fmt(bf.quota_bytes - (bf.used_bytes || 0))} / ${fmt(bf.quota_bytes)}`
-      : "-";
-    const qc = state.quota_check;
-    $("quota-cover").textContent = qc
-      ? (qc.combined_covers_tail ? "是（两项额度够补尾段）" : "否（额度不足）")
-      : "-";
+    $("rounds").textContent = state.probe_rounds !== undefined ? fmt(state.probe_rounds) : "-";
+    $("elapsed").textContent = state.elapsed_ms !== undefined ? `${fmt(state.elapsed_ms)} ms` : "-";
+    $("error").textContent = state.error || "-";
+    $("error").className = "v " + (state.error ? "incomplete" : "");
 
-    const origin = state.origin || {};
-    $("origin-sent").textContent = fmt(origin.bytes_sent || 0);
-    $("origin-reqs").textContent = `${fmt(origin.main_requests || 0)} / ${fmt(origin.range_requests || 0)}`;
-    $("origin-version").textContent = origin.current_version || "-";
-    if (origin.current_version) currentOriginVersion = origin.current_version;
+    const sides = state.sides || {};
+    renderSide("a", sides.a);
+    renderSide("b", sides.b);
 
-    const ret = state.retention || {};
-    $("retention-peak").textContent = fmt(ret.peak_bytes || 0);
-    $("retention-split").textContent = `${fmt(ret.peak_memory_bytes || 0)} / ${fmt(ret.peak_disk_bytes || 0)}`;
-    $("retention-used").textContent = `${fmt(ret.used_bytes || 0)} / ${fmt(ret.capacity_bytes || 0)}`;
+    const budget = state.budget || {};
+    $("body-total").textContent = fmt(budget.combined_body_bytes || 0);
+    $("req-cap").textContent = fmt(budget.max_requests_per_side || 16);
+    $("body-cap").textContent = fmt(budget.max_combined_body_bytes || 16384);
+    $("req-headroom").textContent = fmt(budget.requests_headroom || 0);
+    $("body-headroom").textContent = fmt(budget.body_headroom || 0);
 
-    const sw = state.origin_switch || {};
-    const swEl = $("origin-switch");
-    if (sw.triggered) {
-      swEl.hidden = false;
-      const src = sw.source === "auto_on_pause" ? "慢端暂停时自动换版" : "手动换版";
-      swEl.textContent = `${src}：源站 ${sw.from || "?"} → ${sw.to || "?"}；已开始的主下载仍按原版继续。`;
+    renderDifferences(state.differences, outcome);
+
+    const swapped = state.swapped || [];
+    const swapEl = $("swap-notice");
+    if (swapped.length) {
+      swapEl.hidden = false;
+      swapEl.textContent = swapped
+        .map((s) => `${(s.side || "").toUpperCase()} 端 ${s.from} → ${s.to}：${s.note || ""}`)
+        .join("；");
     } else {
-      swEl.hidden = true;
+      swapEl.hidden = true;
     }
 
     renderEvents(state.events);
 
-    if (state.error) showNotice(`演练出错：${state.error}`);
-    else if (state.origin_error) showNotice(`源站状态读取失败：${state.origin_error}`, "info");
+    if (state.error && status === "done") showNotice(`核对未完成：${state.error}`);
     else clearNotice();
+
+    setBusy(status === "running");
   }
 
   async function poll() {
     try {
-      const resp = await fetch("/api/drill");
+      const resp = await fetch("/api/check");
       const state = await resp.json();
       render(state);
       if (state.status === "running") {
-        pollTimer = setTimeout(poll, 300);
+        pollTimer = setTimeout(poll, 250);
       } else {
         pollTimer = null;
-        $("start-btn").disabled = false;
       }
     } catch (err) {
       showNotice(`无法读取状态：${err}`);
@@ -175,9 +194,9 @@
   form.addEventListener("submit", async (ev) => {
     ev.preventDefault();
     clearNotice();
-    $("start-btn").disabled = true;
+    setBusy(true);
     try {
-      const resp = await fetch("/api/drill", {
+      const resp = await fetch("/api/check", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify(formPayload()),
@@ -188,40 +207,43 @@
       }
       startPolling();
     } catch (err) {
-      $("start-btn").disabled = false;
+      setBusy(false);
       showNotice(`启动失败：${err.message || err}`);
     }
   });
 
-  let currentOriginVersion = "v1";
-
-  $("switch-btn").addEventListener("click", async () => {
-    const target = currentOriginVersion === "v1" ? "v2" : "v1";
+  $("preset-128").addEventListener("click", async () => {
+    const fields = form.elements;
+    fields.namedItem("scenario").value = "single_block_diff";
+    fields.namedItem("size_bytes").value = "134217728";
+    fields.namedItem("diff_block").value = "";
+    clearNotice();
+    setBusy(true);
     try {
-      const resp = await fetch(`/api/drill/switch?version=${target}`, { method: "POST" });
+      const resp = await fetch("/api/check", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ size_bytes: 134217728, scenario: "single_block_diff" }),
+      });
       if (!resp.ok) {
         const body = await resp.json().catch(() => ({}));
         throw new Error(body.detail ? JSON.stringify(body.detail) : `HTTP ${resp.status}`);
       }
       startPolling();
     } catch (err) {
-      showNotice(`换版失败：${err.message || err}`);
+      setBusy(false);
+      showNotice(`启动失败：${err.message || err}`);
     }
   });
 
-  $("reset-btn").addEventListener("click", async () => {
-    $("start-btn").disabled = false;
+  $("cancel-btn").addEventListener("click", async () => {
     try {
-      const resp = await fetch("/api/drill/reset", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify(formPayload()),
-      });
+      const resp = await fetch("/api/check/cancel", { method: "POST" });
       const body = await resp.json();
       render(body.state || {});
       if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
     } catch (err) {
-      showNotice(`重置失败：${err.message || err}`);
+      showNotice(`取消失败：${err.message || err}`);
     }
   });
 

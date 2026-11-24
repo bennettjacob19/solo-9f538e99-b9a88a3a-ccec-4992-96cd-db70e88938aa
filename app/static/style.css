@@ -90,3 +90,11 @@ table.routes th { color: var(--muted); font-size: 12px; font-weight: 500; }
 .events .t { color: var(--muted); font-family: ui-monospace, monospace; white-space: nowrap; }
 .events .kind { width: 74px; flex: none; color: var(--accent); text-transform: uppercase; font-size: 11px; padding-top: 1px; }
 .events .kind.error { color: var(--bad); }
+
+select {
+  background: #0d1117; color: var(--text); border: 1px solid var(--line);
+  border-radius: 6px; padding: 7px 9px; font-size: 13px;
+}
+.hint { color: var(--muted); font-size: 12px; margin: 12px 0 0; }
+code { font-family: ui-monospace, monospace; color: var(--text); }
+td.mono { font-family: ui-monospace, monospace; font-size: 12.5px; }

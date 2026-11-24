@@ -3,31 +3,33 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>跨机房镜像层分发演练</title>
+<title>跨机房镜像层核对</title>
 <link rel="stylesheet" href="/static/style.css" />
 </head>
 <body>
 <header>
-  <h1>跨机房镜像层分发演练</h1>
-  <p class="sub">一个 HTTP 主下载 · 快慢两路 · 慢端 3/4 暂停 · 网关留存 / 条件补段 · 原版 SHA-256 校验</p>
+  <h1>跨机房镜像层核对</h1>
+  <p class="sub">两个本地 HTTP 源站 · 各自锁定首次应答的强 ETag · 只取元数据 · 64 KiB 分块列出全部差异区间</p>
 </header>
 
 <main>
   <section class="card controls">
-    <h2>演练参数</h2>
-    <form id="drill-form">
-      <label>层大小 (字节)<input name="size_bytes" type="number" value="8388608" min="1024" step="1024"></label>
-      <label>主下载分块 (字节)<input name="chunk_size" type="number" value="65536" min="1024" step="1024"></label>
-      <label>每块延迟 (ms)<input name="chunk_delay_ms" type="number" value="15" min="0" max="2000"></label>
-      <label>网关留存正文额度（内存+磁盘）<input name="retention_bytes" type="number" value="1048576" min="0" step="1024"></label>
-      <label>其中内存部分 (字节)<input name="retention_memory_bytes" type="number" value="524288" min="0" step="1024"></label>
-      <label>额外回源正文额度 (字节)<input name="backfill_bytes" type="number" value="2097152" min="0" step="1024"></label>
-      <label>慢端暂停点（占总量比例）<input name="pause_fraction" type="number" value="0.75" min="0.05" max="0.95" step="0.05"></label>
-      <label class="check"><input name="auto_switch_on_pause" type="checkbox"> 慢端暂停时自动把源站换成等长新版</label>
+    <h2>发起核对</h2>
+    <form id="check-form">
+      <label>场景
+        <select name="scenario">
+          <option value="match">层一致</option>
+          <option value="single_block_diff">单块差异</option>
+          <option value="swap_midway">中途换版</option>
+          <option value="origin_fault">源站故障</option>
+        </select>
+      </label>
+      <label>层大小 (字节)<input name="size_bytes" type="number" value="8388608" min="65536" max="134217728" step="65536"></label>
+      <label>差异块序号（留空按场景默认）<input name="diff_block" type="number" value="" min="-2048" max="2047" step="1" placeholder="自动"></label>
       <div class="actions">
-        <button id="start-btn" type="submit">开始演练</button>
-        <button id="switch-btn" type="button" class="secondary">立即换版（v1↔v2）</button>
-        <button id="reset-btn" type="button" class="ghost">重置</button>
+        <button id="start-btn" type="submit">开始核对</button>
+        <button id="preset-128" type="button" class="secondary">128 MiB 单块差异样例</button>
+        <button id="cancel-btn" type="button" class="ghost" disabled>取消</button>
       </div>
     </form>
     <div id="notice" class="notice" hidden></div>
@@ -36,59 +38,69 @@
   <section class="card">
     <h2>总体状态</h2>
     <div class="status-grid">
-      <div><span class="k">阶段</span><span id="phase" class="v">idle</span></div>
-      <div><span class="k">结果</span><span id="outcome" class="v">pending</span></div>
-      <div><span class="k">层大小</span><span id="total-bytes" class="v">-</span></div>
-      <div><span class="k">主下载强 ETag</span><span id="main-etag" class="v mono">-</span></div>
-      <div><span class="k">原版 SHA-256</span><span id="expected-sha" class="v mono">-</span></div>
+      <div><span class="k">阶段</span><span id="status" class="v">idle</span></div>
+      <div><span class="k">结果</span><span id="outcome" class="v">待运行</span></div>
+      <div><span class="k">场景</span><span id="scenario" class="v">-</span></div>
+      <div><span class="k">层大小 / 分块</span><span id="size-info" class="v">-</span></div>
+      <div><span class="k">差异区间 / 字节</span><span id="diff-summary" class="v">-</span></div>
+      <div><span class="k">探针轮次</span><span id="rounds" class="v">-</span></div>
       <div><span class="k">耗时</span><span id="elapsed" class="v">-</span></div>
+      <div><span class="k">错误</span><span id="error" class="v">-</span></div>
     </div>
+    <div id="swap-notice" class="notice info" hidden></div>
   </section>
 
   <section class="card">
-    <h2>两路实收与校验</h2>
+    <h2>锁定的版本</h2>
     <table class="routes">
       <thead>
-        <tr><th>路线</th><th>实收字节</th><th>进度</th><th>SHA-256 校验</th><th>缺段</th></tr>
+        <tr><th>端</th><th>锁定强 ETag</th><th>锁定版本</th><th>当前版本</th><th>长度 / 块数</th><th>锁定版是否在服务</th></tr>
       </thead>
       <tbody>
-        <tr id="row-fast">
-          <td>快端</td>
-          <td id="fast-bytes" class="mono">0</td>
-          <td><div class="bar"><div id="fast-bar" class="fill fast"></div></div></td>
-          <td id="fast-verify" class="pending">待运行</td>
-          <td>-</td>
+        <tr>
+          <td>A</td>
+          <td id="a-etag" class="mono">-</td>
+          <td id="a-version" class="v">-</td>
+          <td id="a-current" class="v">-</td>
+          <td id="a-size" class="mono">-</td>
+          <td id="a-served" class="v">-</td>
         </tr>
-        <tr id="row-slow">
-          <td>慢端</td>
-          <td id="slow-bytes" class="mono">0</td>
-          <td><div class="bar"><div id="slow-bar" class="fill slow"></div></div></td>
-          <td id="slow-verify" class="pending">待运行</td>
-          <td id="slow-missing" class="mono">-</td>
+        <tr>
+          <td>B</td>
+          <td id="b-etag" class="mono">-</td>
+          <td id="b-version" class="v">-</td>
+          <td id="b-current" class="v">-</td>
+          <td id="b-size" class="mono">-</td>
+          <td id="b-served" class="v">-</td>
         </tr>
       </tbody>
     </table>
-    <div class="route-detail">
-      <div><span class="k">慢端暂停点</span><span id="slow-pause" class="v">-</span></div>
-      <div><span class="k">慢端已续传</span><span id="slow-resumed" class="v">-</span></div>
-      <div><span class="k">补段校验（ETag/区间）</span><span id="backfill-verify" class="v">-</span></div>
-      <div><span class="k">补段状态</span><span id="backfill-status" class="v">-</span></div>
-      <div><span class="k">补段额度余量</span><span id="backfill-quota" class="v">-</span></div>
-      <div><span class="k">额度覆盖尾部</span><span id="quota-cover" class="v">-</span></div>
-    </div>
+    <p class="hint">锁定后所有核对请求都带 <code>If-Match: &lt;锁定 ETag&gt;</code>，源站即使换版也按锁定的两版返回元数据。</p>
   </section>
 
   <section class="card">
-    <h2>源站实发与网关暂存</h2>
+    <h2>差异字节区间（64 KiB 分块，末块按实际长度）</h2>
+    <div id="no-diff" class="pending">尚无差异。</div>
+    <table id="diff-table" class="routes" hidden>
+      <thead><tr><th>#</th><th>起始字节</th><th>结束字节</th><th>长度</th><th>覆盖块</th></tr></thead>
+      <tbody id="diff-body"></tbody>
+    </table>
+  </section>
+
+  <section class="card">
+    <h2>实际用量</h2>
     <div class="status-grid">
-      <div><span class="k">源站累计实发</span><span id="origin-sent" class="v mono">0</span></div>
-      <div><span class="k">主下载 / 补段请求数</span><span id="origin-reqs" class="v">0 / 0</span></div>
-      <div><span class="k">源站当前版本</span><span id="origin-version" class="v">v1</span></div>
-      <div><span class="k">网关暂存峰值</span><span id="retention-peak" class="v mono">0</span></div>
-      <div><span class="k">其中内存 / 磁盘峰值</span><span id="retention-split" class="v mono">0 / 0</span></div>
-      <div><span class="k">暂存额度 / 已用</span><span id="retention-used" class="v mono">0 / 0</span></div>
+      <div><span class="k">A 端核对请求（含锁定的 HEAD）</span><span id="a-req" class="v mono">0</span></div>
+      <div><span class="k">B 端核对请求（含锁定的 HEAD）</span><span id="b-req" class="v mono">0</span></div>
+      <div><span class="k">两端应答正文合计</span><span id="body-total" class="v mono">0</span></div>
+      <div><span class="k">A 端应答正文</span><span id="a-body" class="v mono">0</span></div>
+      <div><span class="k">B 端应答正文</span><span id="b-body" class="v mono">0</span></div>
+      <div><span class="k">请求上限（每端）</span><span id="req-cap" class="v mono">16</span></div>
+      <div><span class="k">正文上限（两端合计）</span><span id="body-cap" class="v mono">16384</span></div>
+      <div><span class="k">请求余量（两端合计）</span><span id="req-headroom" class="v mono">-</span></div>
+      <div><span class="k">正文余量</span><span id="body-headroom" class="v mono">-</span></div>
     </div>
-    <div id="origin-switch" class="notice info" hidden></div>
+    <p class="hint">只统计核对请求（HEAD + 元数据探针）；场景初始化时的 reset / switch 不计入。</p>
   </section>
 
   <section class="card">
